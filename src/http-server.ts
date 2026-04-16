@@ -350,28 +350,39 @@ class GHLMCPHttpServer {
       }
     });
 
-    // SSE endpoint for ChatGPT MCP connection
-    const handleSSE = async (req: express.Request, res: express.Response) => {
-      const sessionId = req.query.sessionId || 'unknown';
-      console.log(`[GHL MCP HTTP] New SSE connection from: ${req.ip}, sessionId: ${sessionId}, method: ${req.method}`);
-      
+    // SSE endpoint for ChatGPT MCP connection.
+    // Proper MCP SSE transport requires separate GET (open stream) and POST
+    // (deliver JSON-RPC message for the stream's session) handlers. The
+    // SDK's SSEServerTransport exposes a sessionId after construction; we
+    // store it so POSTs can be routed to the right open stream.
+    const sseTransports = new Map<string, SSEServerTransport>();
+
+    const handleSSEConnect = async (req: express.Request, res: express.Response) => {
+      console.log(`[GHL MCP HTTP] New SSE connection from: ${req.ip}`);
+
       try {
-        // Create SSE transport (this will set the headers)
+        // Advertise the same /sse path as the POST endpoint; clients will
+        // receive an `endpoint` event like /sse?sessionId=<id>
         const transport = new SSEServerTransport('/sse', res);
-        
-        // Connect MCP server to transport
+        sseTransports.set(transport.sessionId, transport);
+
+        // Connect MCP server to transport (this also sends the endpoint event)
         await this.server.connect(transport);
-        
-        console.log(`[GHL MCP HTTP] SSE connection established for session: ${sessionId}`);
-        
-        // Handle client disconnect
-        req.on('close', () => {
-          console.log(`[GHL MCP HTTP] SSE connection closed for session: ${sessionId}`);
-        });
-        
+
+        console.log(`[GHL MCP HTTP] SSE connection established for session: ${transport.sessionId}`);
+
+        // Clean up on disconnect
+        const cleanup = () => {
+          if (sseTransports.delete(transport.sessionId)) {
+            console.log(`[GHL MCP HTTP] SSE connection closed for session: ${transport.sessionId}`);
+          }
+        };
+        res.on('close', cleanup);
+        req.on('close', cleanup);
+
       } catch (error) {
-        console.error(`[GHL MCP HTTP] SSE connection error for session ${sessionId}:`, error);
-        
+        console.error(`[GHL MCP HTTP] SSE connection error:`, error);
+
         // Only send error response if headers haven't been sent yet
         if (!res.headersSent) {
           res.status(500).json({ error: 'Failed to establish SSE connection' });
@@ -382,9 +393,33 @@ class GHLMCPHttpServer {
       }
     };
 
-    // Handle both GET and POST for SSE (MCP protocol requirements)
-    this.app.get('/sse', handleSSE);
-    this.app.post('/sse', handleSSE);
+    const handleSSEMessage = async (req: express.Request, res: express.Response) => {
+      const sessionId = (req.query.sessionId as string) || '';
+      console.log(`[GHL MCP HTTP] POST message for session: ${sessionId}`);
+
+      const transport = sseTransports.get(sessionId);
+      if (!transport) {
+        console.warn(`[GHL MCP HTTP] No transport found for session: ${sessionId}`);
+        res.status(404).json({ error: 'Session not found' });
+        return;
+      }
+
+      try {
+        // Express.json() already parsed the body; pass it through so the
+        // SDK doesn't try to re-read the drained request stream.
+        await transport.handlePostMessage(req, res, req.body);
+      } catch (error) {
+        console.error(`[GHL MCP HTTP] Error handling POST for session ${sessionId}:`, error);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Failed to handle message' });
+        }
+      }
+    };
+
+    // GET opens a new SSE stream; POST delivers a JSON-RPC message to an
+    // existing stream identified by ?sessionId=<id>
+    this.app.get('/sse', handleSSEConnect);
+    this.app.post('/sse', handleSSEMessage);
 
     // Root endpoint with server info
     this.app.get('/', (req, res) => {
@@ -742,4 +777,4 @@ async function main(): Promise<void> {
 main().catch((error) => {
   console.error('Unhandled error:', error);
   process.exit(1);
-}); 
+});
